@@ -1,4 +1,4 @@
-// app.js ??Main Controller for EcoCatch
+// app.js — Main Controller for EcoCatch
 // Accesses global data structures: DecisionTree, HashMap, KDTree, Graph, MaxHeap
 // and mockData variables: recycleStations, graphNodes, graphEdges, seedUsers, coupons
 
@@ -8,16 +8,38 @@ let hashMap;
 let kdTree;
 let roadGraph;
 let maxHeap;
+let tmModel = null;
+let isModelLoading = false;
+
+// Load Teachable Machine Image model
+async function loadModel() {
+  if (tmModel) return tmModel;
+  if (isModelLoading) return null;
+  isModelLoading = true;
+  console.log("Loading Teachable Machine model...");
+  try {
+    const modelURL = "./js/model.json";
+    const metadataURL = "./js/metadata.json";
+    // tmImage is loaded from Teachable Machine CDN
+    tmModel = await tmImage.load(modelURL, metadataURL);
+    console.log("Teachable Machine model loaded successfully.");
+  } catch (error) {
+    console.error("Failed to load Teachable Machine model:", error);
+  } finally {
+    isModelLoading = false;
+  }
+  return tmModel;
+}
 
 // User state
 let userProfile = {
   id: "u_current",
-  name: "You (�?",
+  name: "You (你)",
   points: 420,
   carbon: 12.45,
   lat: 25.0160,
   lng: 121.5320,
-  level: "減碳?�人",
+  level: "減碳達人",
   avatarIdx: 7
 };
 
@@ -34,6 +56,7 @@ let currentDecisionNode = null;
 
 // Initialize app when DOM is ready
 document.addEventListener("DOMContentLoaded", () => {
+  loadModel(); // Pre-load Teachable Machine model in background
   initDataStructures();
   setupNav();
   setupDashboard();
@@ -175,102 +198,113 @@ function setupScanner() {
     startDecisionTreeQnA();
   });
 
-  // Handle camera trigger (with YOLOv8 detection via 192.168.11.147:8000)
+  // Handle camera trigger — 啟動相機、擷取畫面並 Rescale 到 224×224
+  // 分類標籤：["寶特瓶（塑膠類）", "鐵鋁罐（金屬類）", "紙便當盒（紙容器）", "衛生紙（一般垃圾）"]
+  // 輸入規格：224 × 224 像素 (RGB)
   btnCamera?.addEventListener("click", () => {
-    // Attempt real camera API
+    // 1. 確認瀏覽器支援 getUserMedia
     if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-      navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
+      // 2. 要求後置鏡頭串流（environment = 後鏡頭）
+      navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: "environment",   // 優先後置鏡頭
+          width:  { ideal: 640 },      // 原始解析度不限，稍後由 canvas rescale
+          height: { ideal: 480 }
+        }
+      })
         .then(stream => {
+          // 3. 將串流綁定到 <video> 元素並顯示即時預覽
           realCameraView.srcObject = stream;
           realCameraView.classList.remove("hidden");
           simulatedViewfinder.classList.add("hidden");
 
-          // Switch button to capture-confirm icon
+          // 4. 切換按鈕為「確認拍照」
           btnCamera.innerHTML = `<span class="material-symbols-outlined text-[40px]">check</span>`;
-          btnCamera.onclick = () => {
-            // Capture a still frame from the live video via canvas
-            const canvas = document.createElement("canvas");
-            canvas.width  = realCameraView.videoWidth  || 640;
-            canvas.height = realCameraView.videoHeight || 480;
-            canvas.getContext("2d").drawImage(realCameraView, 0, 0, canvas.width, canvas.height);
+          btnCamera.onclick = async () => {
+            // ── 擷取畫面並 Rescale 到 224×224 ──────────────────────────────
+            // 建立隱藏的離屏 Canvas，尺寸固定為模型輸入規格 224×224
+            const captureCanvas = document.createElement("canvas");
+            captureCanvas.width  = 224;
+            captureCanvas.height = 224;
+            const ctx = captureCanvas.getContext("2d");
 
-            // Stop camera stream
+            // drawImage 將目前 video 幀直接縮放/裁切至 224×224
+            ctx.drawImage(
+              realCameraView,          // 來源：即時影像
+              0, 0,                    // 來源起點
+              realCameraView.videoWidth  || 640,  // 來源寬
+              realCameraView.videoHeight || 480,  // 來源高
+              0, 0,                    // 目標起點
+              224, 224                 // 目標尺寸：224×224
+            );
+
+            // 取得 224×224 的 ImageData（RGBA Uint8ClampedArray，長度 = 224*224*4）
+            const imageData224 = ctx.getImageData(0, 0, 224, 224);
+
+            // 顯示載入/辨識中狀態
+            btnCamera.innerHTML = `<span class="material-symbols-outlined text-[40px] animate-spin">sync</span>`;
+
+            // 確保模型已載入
+            const model = await loadModel();
+            let categoryId = "general_waste";
+
+            if (model) {
+              try {
+                // 用 Teachable Machine 模型預測 Canvas
+                const predictions = await model.predict(captureCanvas);
+                console.log("Predictions:", predictions);
+
+                // 找出機率最高的類別
+                let maxProb = -1;
+                let bestClass = "";
+                predictions.forEach(p => {
+                  if (p.probability > maxProb) {
+                    maxProb = p.probability;
+                    bestClass = p.className;
+                  }
+                });
+
+                // 對照表映射至系統使用的 categoryId
+                const labelMap = {
+                  "寶特瓶（塑膠類）": "pet_bottle",
+                  "鐵鋁罐（金屬類）": "aluminum_can",
+                  "紙便當盒（紙容器）": "paper_box",
+                  "衛生紙（一般垃圾）": "general_waste"
+                };
+
+                if (labelMap[bestClass]) {
+                  categoryId = labelMap[bestClass];
+                }
+                console.log(`Detected category: ${bestClass} -> ${categoryId} (Prob: ${maxProb.toFixed(4)})`);
+              } catch (predErr) {
+                console.error("Prediction failed, fallback to select value:", predErr);
+                categoryId = cameraSelect.value;
+              }
+            } else {
+              console.warn("Model not loaded, fallback to select value");
+              categoryId = cameraSelect.value;
+            }
+
+            // 5. 停止相機串流並還原 UI
             stream.getTracks().forEach(track => track.stop());
+            realCameraView.srcObject = null;
             realCameraView.classList.add("hidden");
             simulatedViewfinder.classList.remove("hidden");
             btnCamera.innerHTML = `<span class="material-symbols-outlined text-[40px]">photo_camera</span>`;
 
-            // Show loading indicator
-            const yoloStatusEl = document.getElementById("yolo-result-banner") || (() => {
-              const el = document.createElement("div");
-              el.id = "yolo-result-banner";
-              el.className = "mt-3 p-3 rounded-xl bg-white/5 border border-primary/30 text-xs text-on-surface-variant text-center";
-              simulatedViewfinder?.parentNode?.insertBefore(el, simulatedViewfinder.nextSibling);
-              return el;
-            })();
-            yoloStatusEl.textContent = "?? YOLOv8 辨�?中�?;
-
-            // Convert canvas to Blob and POST to YOLOv8 API
-            canvas.toBlob(blob => {
-              const formData = new FormData();
-              formData.append("file", blob, "capture.jpg");
-
-              fetch("http://192.168.11.147:8000/detect", {
-                method: "POST",
-                body: formData
-              })
-                .then(res => {
-                  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                  return res.json();
-                })
-                .then(data => {
-                  // Expected response: { label: "pet_bottle", confidence: 0.92 } or { results: [...] }
-                  const results = data.results || [data];
-                  const top = results[0] || {};
-                  const label      = top.label      || top.class_name || "unknown";
-                  const confidence = top.confidence  || top.score     || 0;
-                  const pct        = (confidence * 100).toFixed(1);
-
-                  // Show result banner
-                  yoloStatusEl.innerHTML = `
-                    <span class="text-secondary font-bold">YOLOv8 辨�?結�?�?/span>
-                    <span class="text-white font-bold">${label}</span>
-                    <span class="text-primary ml-2">信�?�?${pct}%</span>
-                  `;
-
-                  // Map YOLOv8 label to categoryId and run scan pipeline
-                  const labelMap = {
-                    pet_bottle:    "pet_bottle",
-                    bottle:        "pet_bottle",
-                    aluminum_can:  "aluminum_can",
-                    can:           "aluminum_can",
-                    paper_box:     "paper_box",
-                    cardboard:     "paper_box",
-                    general_waste: "general_waste",
-                    trash:         "general_waste"
-                  };
-                  const categoryId = labelMap[label] || "general_waste";
-                  runAutoScan(categoryId);
-                  setupScanner(); // rebind default click handler
-                })
-                .catch(err => {
-                  console.warn("YOLOv8 API ???失�?，採?�模?�辨識�?", err);
-                  yoloStatusEl.innerHTML = `<span class="text-error">??YOLOv8 API ?��??��??�用模擬辨�?</span>`;
-
-                  // Fallback: random scan
-                  const items = ["pet_bottle", "aluminum_can", "paper_box", "general_waste"];
-                  const rand = items[Math.floor(Math.random() * items.length)];
-                  runAutoScan(rand);
-                  setupScanner();
-                });
-            }, "image/jpeg", 0.9);
+            // 6. 觸發後續掃描流程
+            runAutoScan(categoryId, imageData224);
+            setupScanner(); // 重新綁定預設點擊事件
           };
         })
         .catch(err => {
-          alert("?��??��??��?權�?，採?�模?��??��?);
+          // 相機權限被拒或裝置不支援，回退至模擬掃描
+          console.warn("相機啟動失敗：", err);
+          alert("無法啟動相機權限，採用模擬拍照。");
           runAutoScan(cameraSelect.value);
         });
     } else {
+      // 瀏覽器不支援 getUserMedia，直接模擬
       runAutoScan(cameraSelect.value);
     }
   });
@@ -351,8 +385,8 @@ function renderQnAStep() {
     const details = hashMap.get(currentDecisionNode.categoryId);
     qnaContainer.innerHTML = `
       <div class="glass-panel p-md rounded-xl text-center space-y-md">
-        <h4 class="font-title-md text-primary">?�� 決�?樹走訪�??��?結�??��?${currentDecisionNode.label}</h4>
-        <button id="btn-qna-apply" class="bg-primary text-on-primary px-4 py-2 rounded-xl text-label-md font-bold w-full">載入 HashMap 資�?</button>
+        <h4 class="font-title-md text-primary">🌳 決策樹走訪完畢！結果為：${currentDecisionNode.label}</h4>
+        <button id="btn-qna-apply" class="bg-primary text-on-primary px-4 py-2 rounded-xl text-label-md font-bold w-full">載入 HashMap 資料</button>
       </div>
     `;
     
@@ -366,13 +400,13 @@ function renderQnAStep() {
   qnaContainer.innerHTML = `
     <div class="glass-panel p-md rounded-xl space-y-md">
       <div class="flex items-center justify-between">
-        <span class="text-xs text-on-surface-variant font-bold uppercase tracking-wider">?�� 決�?樹�?點�?${currentDecisionNode.label}</span>
+        <span class="text-xs text-on-surface-variant font-bold uppercase tracking-wider">🌳 決策樹節點：${currentDecisionNode.label}</span>
         <span class="text-[10px] bg-primary/20 text-primary px-2 py-0.5 rounded font-mono">Complexity: O(log N)</span>
       </div>
       <p class="font-body-md text-white">${currentDecisionNode.question}</p>
       <div class="grid grid-cols-2 gap-md">
-        <button id="btn-qna-yes" class="bg-primary/20 hover:bg-primary text-primary hover:text-on-primary border border-primary/40 py-2.5 rounded-xl font-bold transition-all">??(YES)</button>
-        <button id="btn-qna-no" class="bg-error/10 hover:bg-error text-error hover:text-on-error border border-error/40 py-2.5 rounded-xl font-bold transition-all">??(NO)</button>
+        <button id="btn-qna-yes" class="bg-primary/20 hover:bg-primary text-primary hover:text-on-primary border border-primary/40 py-2.5 rounded-xl font-bold transition-all">是 (YES)</button>
+        <button id="btn-qna-no" class="bg-error/10 hover:bg-error text-error hover:text-on-error border border-error/40 py-2.5 rounded-xl font-bold transition-all">否 (NO)</button>
       </div>
     </div>
   `;
@@ -440,7 +474,7 @@ function setupMap() {
 
   // Add User Marker
   userMarker = L.marker([userProfile.lat, userProfile.lng], { icon: userIcon, draggable: true }).addTo(map);
-  userMarker.bindPopup("<b>你�?位置</b><br>?��??�以?��?座�?").openPopup();
+  userMarker.bindPopup("<b>你的位置</b><br>可拖曳以改變座標").openPopup();
 
   // Listen to dragend
   userMarker.on("dragend", (e) => {
@@ -469,7 +503,7 @@ function setupMap() {
     });
 
     const marker = L.marker([station.lat, station.lng], { icon: stationIcon }).addTo(map);
-    marker.bindPopup(`<b>${station.name}</b><br>?��?${station.accepted.map(id => hashMap.get(id)?.name || id).join(", ")}`);
+    marker.bindPopup(`<b>${station.name}</b><br>收：${station.accepted.map(id => hashMap.get(id)?.name || id).join(", ")}`);
     stationMarkers.push({ id: station.id, marker });
   });
 
@@ -520,7 +554,7 @@ function setupMap() {
   
   btnLocateMe?.addEventListener("click", () => {
     if (!navigator.geolocation) {
-      alert("?��??�覽?��??�援定�??�能??);
+      alert("您的瀏覽器不支援定位功能。");
       return;
     }
 
@@ -541,7 +575,7 @@ function setupMap() {
 
         // Move user marker & open popup
         userMarker.setLatLng([lat, lng]);
-        userMarker.bindPopup("<b>你�?位置</b><br>已�?位�??��??��??�以微調座�?").openPopup();
+        userMarker.bindPopup("<b>你的位置</b><br>已定位完成！可拖曳以微調座標").openPopup();
 
         // Pan map center
         map.setView([lat, lng], 16, { animate: true });
@@ -558,17 +592,17 @@ function setupMap() {
         btnLocateMe.disabled = false;
       },
       (error) => {
-        console.error("定�?失�?�?, error);
-        let msg = "?��??��??��?定�?位置??;
+        console.error("定位失敗：", error);
+        let msg = "無法取得您的定位位置。";
         switch (error.code) {
           case error.PERMISSION_DENIED:
-            msg = "定�?失�?：�??�許?�覽?��??�您?��?置�??��?;
+            msg = "定位失敗：請允許瀏覽器存取您的位置權限。";
             break;
           case error.POSITION_UNAVAILABLE:
-            msg = "定�?失�?：�?置�?訊無法�?得�?請確�?GPS 已�??��?;
+            msg = "定位失敗：位置資訊無法取得，請確認 GPS 已開啟。";
             break;
           case error.TIMEOUT:
-            msg = "定�?失�?：�?得�?置�??��?請�?試�?;
+            msg = "定位失敗：取得位置超時，請重試。";
             break;
         }
         alert(msg);
@@ -631,7 +665,7 @@ function searchNearestBin(categoryId = null) {
   }
   
   if (candidates.length === 0) {
-    alert("?��?沒�??�收點支?�該?�圾種�??�收�?);
+    alert("目前沒有回收點支援該垃圾種類回收！");
     return;
   }
 
@@ -650,13 +684,13 @@ function searchNearestBin(categoryId = null) {
       <div class="flex items-center gap-2 text-xs">
         <span class="material-symbols-outlined text-primary text-sm">hub</span>
         <span class="font-label-sm text-on-surface-variant">
-          KD-Tree ?��?完�?：�? <span class="text-primary">${candidates.length}</span> ?�候選點找?��?近�?，耗�? <span class="text-primary">12ms</span>
+          KD-Tree 搜尋完成：從 <span class="text-primary">${candidates.length}</span> 個候選點找到最近點，耗時 <span class="text-primary">12ms</span>
         </span>
       </div>
       <div class="h-4 w-[1px] bg-white/10"></div>
       <div class="flex items-center gap-2 text-xs">
         <span class="material-symbols-outlined text-secondary text-sm">reorder</span>
-        <span class="font-label-sm text-on-surface-variant">Dijkstra ?��??��?佇�?作�?�?/span>
+        <span class="font-label-sm text-on-surface-variant">Dijkstra 堆積優先佇列作動中</span>
       </div>
     `;
   }
@@ -670,7 +704,7 @@ function searchNearestBin(categoryId = null) {
       li.className = "text-[10px] text-on-surface-variant flex justify-between py-1 border-b border-white/5";
       li.innerHTML = `
         <span>Step ${idx+1}: 走訪 [${step.nodeName}]</span>
-        <span class="text-secondary">?��?維度: ${step.axis} | 距離: ${step.dist}</span>
+        <span class="text-secondary">切分維度: ${step.axis} | 距離: ${step.dist}</span>
       `;
       kdTraceList.appendChild(li);
     });
@@ -753,15 +787,15 @@ function searchNearestBin(categoryId = null) {
   if (dijkstraTraceList && routeResult.path.length > 0) {
     dijkstraTraceList.innerHTML = "";
     
-    const pathStr = routeResult.path.map(id => graphNodes[id].name || id).join(" ??");
+    const pathStr = routeResult.path.map(id => graphNodes[id].name || id).join(" → ");
     const divPath = document.createElement("div");
     divPath.className = "text-[11px] text-primary font-bold mb-2";
-    divPath.innerHTML = `?? Dijkstra ?�?�?�路�? ${pathStr}`;
+    divPath.innerHTML = `🏁 Dijkstra 最最短路徑: ${pathStr}`;
     dijkstraTraceList.appendChild(divPath);
 
     const divVisited = document.createElement("div");
     divVisited.className = "text-[10px] text-on-surface-variant";
-    divVisited.innerHTML = `?? ?�小�?�?(Min-Heap) ?��?走訪節點�?�? <br> ${routeResult.visitedOrder.map(id => graphNodes[id].name || id).join(" -> ")}`;
+    divVisited.innerHTML = `🔍 最小堆積 (Min-Heap) 排序走訪節點順序: <br> ${routeResult.visitedOrder.map(id => graphNodes[id].name || id).join(" -> ")}`;
     dijkstraTraceList.appendChild(divVisited);
   }
 
@@ -833,7 +867,7 @@ function handleDepositSuccess() {
   const btn = document.getElementById("btn-verify-deposit");
   const originalText = btn.innerHTML;
   
-  btn.innerHTML = '<span class="material-symbols-outlined animate-spin text-sm">sync</span> ?�慧驗�?�?..';
+  btn.innerHTML = '<span class="material-symbols-outlined animate-spin text-sm">sync</span> 智慧驗證中...';
   btn.disabled = true;
   btn.style.opacity = "0.7";
 
@@ -854,18 +888,18 @@ function handleDepositSuccess() {
     renderLeaderboardList();
 
     // Success styling
-    btn.innerHTML = `<span class="material-symbols-outlined">stars</span> ?��??��?�?${earnedPts} 減碳點`;
+    btn.innerHTML = `<span class="material-symbols-outlined">stars</span> 成功投遞！+${earnedPts} 減碳點`;
     btn.classList.remove("bg-primary");
     btn.classList.add("bg-secondary");
     btn.style.opacity = "1";
     btn.disabled = false;
 
     // Add activity record
-    addActivityRecord(activeScanItem ? activeScanItem.name : "?�收?��?", earnedPts);
+    addActivityRecord(activeScanItem ? activeScanItem.name : "回收物品", earnedPts);
 
     // Alert
     setTimeout(() => {
-      alert(`?? ?��?完�??��??��?！\n?��?點數: +${earnedPts} pts\n減碳?? -${co2Saved} kg`);
+      alert(`🎉 恭喜完成分類投遞！\n獲得點數: +${earnedPts} pts\n減碳量: -${co2Saved} kg`);
       
       // Reset scan & routing state
       activeScanItem = null;
@@ -901,8 +935,8 @@ function addActivityRecord(itemName, points) {
         <span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">recycling</span>
       </div>
       <div>
-        <p class="font-body-md text-body-md text-on-surface">?��? ${itemName}</p>
-        <p class="font-label-sm text-label-sm text-on-surface-variant/60">?��??�收�????��?</p>
+        <p class="font-body-md text-body-md text-on-surface">投遞 ${itemName}</p>
+        <p class="font-label-sm text-label-sm text-on-surface-variant/60">環保回收站 • 剛剛</p>
       </div>
     </div>
     <div class="flex items-center text-primary font-bold">
@@ -962,8 +996,8 @@ function renderLeaderboardList() {
         <div class="flex items-center gap-3">
           <img alt="${u.name}" class="w-10 h-10 rounded-full bg-surface-container shrink-0 object-cover" src="${avatars[u.avatarIdx] || avatars[7]}"/>
           <div>
-            <p class="font-title-md text-on-surface text-sm ${isCurrentUser ? 'font-bold text-primary' : ''}">${u.name} ${isCurrentUser ? '(�?' : ''}</p>
-            <p class="text-xs text-on-surface-variant/70">${u.level || '?��?衛士'}</p>
+            <p class="font-title-md text-on-surface text-sm ${isCurrentUser ? 'font-bold text-primary' : ''}">${u.name} ${isCurrentUser ? '(你)' : ''}</p>
+            <p class="text-xs text-on-surface-variant/70">${u.level || '地球衛士'}</p>
           </div>
         </div>
       </div>
@@ -1071,7 +1105,7 @@ function setupCoupons() {
         <div class="flex items-center justify-between mt-2">
           <span class="text-primary font-bold text-sm">${coupon.points} pts</span>
           <button data-coupon-id="${coupon.id}" class="bg-primary hover:bg-primary-container text-on-primary-container px-4 py-1.5 rounded-lg text-xs font-bold active:scale-95 transition-transform btn-redeem">
-            ?��?
+            兌換
           </button>
         </div>
       </div>
@@ -1093,11 +1127,11 @@ function redeemCoupon(couponId) {
   if (!coupon) return;
 
   if (userProfile.points < coupon.points) {
-    alert(`??點數不足！\n?�目?��? ${userProfile.points} 點�??��?此�??��?�?${coupon.points} 點。`);
+    alert(`❌ 點數不足！\n您目前有 ${userProfile.points} 點，兌換此商品需要 ${coupon.points} 點。`);
     return;
   }
 
-  const confirmRedeem = confirm(`確�?要花�?${coupon.points} 點�??��?{coupon.merchant} - ${coupon.title}?��?？`);
+  const confirmRedeem = confirm(`確定要花費 ${coupon.points} 點兌換「${coupon.merchant} - ${coupon.title}」嗎？`);
   if (!confirmRedeem) return;
 
   // Deduct points
@@ -1111,7 +1145,7 @@ function redeemCoupon(couponId) {
   renderLeaderboardTree();
   renderLeaderboardList();
   
-  alert(`?? ?��??��?！\n已扣?��??? ${coupon.points} pts\n?��?點數: ${userProfile.points} pts\n?��??��?碼已?�送至?��??�就夾中！`);
+  alert(`🎉 兌換成功！\n已扣除點數: ${coupon.points} pts\n剩餘點數: ${userProfile.points} pts\n優惠券條碼已發送至您的成就夾中！`);
 }
 
 // 7. Login screen controller
@@ -1129,13 +1163,13 @@ function setupLogin() {
     
     loginSubmitBtn.disabled = true;
     const originalContent = loginSubmitBtn.innerHTML;
-    loginSubmitBtn.innerHTML = `<span class="material-symbols-outlined text-lg animate-spin">sync</span> 驗�?�?..`;
+    loginSubmitBtn.innerHTML = `<span class="material-symbols-outlined text-lg animate-spin">sync</span> 驗證中...`;
     
     setTimeout(() => {
       if (username && username.trim() !== "") {
         let displayName = username.split('@')[0];
         displayName = displayName.charAt(0).toUpperCase() + displayName.slice(1);
-        userProfile.name = `${displayName} (�?`;
+        userProfile.name = `${displayName} (你)`;
         
         // Remove and re-insert or update user points to sync structure
         if (maxHeap) {
@@ -1157,7 +1191,7 @@ function setupLogin() {
         }, 100);
       }
       
-      alert(`歡�??��?�?{userProfile.name}！\n已�??�登??EcoCatch ?�慧?�圾?��?平台?�`);
+      alert(`歡迎回來，${userProfile.name}！\n已成功登入 EcoCatch 智慧垃圾分類平台。`);
     }, 1200);
   };
 
